@@ -88,7 +88,7 @@ MOI.dimension(sets::MixOfScalarSets) = length(sets.set_ids)
 
 rows(::MixOfScalarSets, ci::MOI.ConstraintIndex) = ci.value
 
-function add_set(sets::MixOfScalarSets, i)
+function add_set(sets::MixOfScalarSets, i::Int)::Int64
     push!(sets.set_ids, i)
     return length(sets.set_ids)
 end
@@ -170,17 +170,14 @@ macro product_of_sets(name, set_types...)
         mutable struct $(esc_name){$(T)} <:
                        $MOI.Utilities.OrderedProductOfSets{$(T)}
             """
-            During the copy, this counts the number of rows corresponding to
-            each set. At the end of copy, `final_touch` is called, which
-            converts this list into a cumulative ordering.
-            """
-            num_rows::Vector{Int}
+            `rows[i][j]` corresponds to constraint `j` of set type `i`.
 
+            The value depends on `final_touch`:
+             * Before `final_touch`, these are `1:dimension` of the constraint
+             * After `final_touch`, these are the 1-indexed rows of the full
+               constraint matrix
             """
-            A dictionary which maps the `set_index` and `offset` of a set to the
-            dimension, that is, `dimension[(set_index,offset)] → dim`.
-            """
-            dimension::Dict{Tuple{Int,Int},Int}
+            rows::Vector{Vector{UnitRange{Int}}}
 
             """
             A sanity bit to check that we don't call functions out-of-order.
@@ -188,73 +185,76 @@ macro product_of_sets(name, set_types...)
             final_touch::Bool
 
             function $(esc_name){$(T)}() where {$(T)}
-                return new(
-                    zeros(Int, $(length(set_types))),
-                    Dict{Tuple{Int,Int},Int}(),
-                    false,
-                )
+                n = $(length(set_types))
+                return new([UnitRange{Int}[] for _ in 1:n], false)
             end
         end
     )
     return _sets_code(esc_name, T, type_def, set_types...)
 end
 
-MOI.is_empty(sets::OrderedProductOfSets) = all(iszero, sets.num_rows)
+MOI.is_empty(sets::OrderedProductOfSets) = all(isempty, sets.rows)
 
 function MOI.empty!(sets::OrderedProductOfSets)
-    fill!(sets.num_rows, 0)
-    empty!(sets.dimension)
+    map(empty!, sets.rows)
     sets.final_touch = false
     return
 end
 
-function MOI.dimension(sets::OrderedProductOfSets)
+function MOI.dimension(sets::OrderedProductOfSets)::Int
     @assert sets.final_touch
-    if isempty(sets.num_rows)
-        # There is no set type
-        return 0
-    else
-        return sets.num_rows[end]
+    for i in reverse(eachindex(sets.rows))
+        if !isempty(sets.rows[i])
+            return last(sets.rows[i][end])
+        end
     end
+    return 0  # All rows were empty.
+end
+
+# A backwards-compatible method to ensure callers of `sets.num_rows` still
+# works.
+function Base.getproperty(sets::OrderedProductOfSets, key::Symbol)
+    if key == :num_rows
+        if sets.final_touch
+            return cumsum(num_rows(sets, S) for S in set_types(sets))
+        end
+        return Int[num_rows(sets, S) for S in set_types(sets)]
+    end
+    return getfield(sets, key)
 end
 
 function rows(
     sets::OrderedProductOfSets{T},
     ci::MOI.ConstraintIndex{MOI.ScalarAffineFunction{T},S},
-) where {T,S}
+)::Int where {T,S}
     @assert sets.final_touch
     i = set_index(sets, S)::Int
-    return (i == 1 ? 0 : sets.num_rows[i-1]) + ci.value
+    return only(sets.rows[i][ci.value])
 end
 
 function rows(
     sets::OrderedProductOfSets{T},
     ci::MOI.ConstraintIndex{MOI.VectorAffineFunction{T},S},
-) where {T,S}
+)::UnitRange{Int} where {T,S}
     @assert sets.final_touch
     i = set_index(sets, S)::Int
-    offset = i == 1 ? 0 : sets.num_rows[i-1]
-    return (offset + ci.value - 1) .+ (1:sets.dimension[(i, ci.value)])
+    return sets.rows[i][ci.value]
 end
 
-function add_set(sets::OrderedProductOfSets, i)
+function add_set(sets::OrderedProductOfSets, i::Int, dim::Int = 1)::Int64
     @assert !sets.final_touch
-    sets.num_rows[i] += 1
-    return sets.num_rows[i]
+    push!(sets.rows[i], 1:dim)
+    return length(sets.rows[i])
 end
 
-function add_set(sets::OrderedProductOfSets, i, dim)
+function final_touch(sets::OrderedProductOfSets)::Nothing
     @assert !sets.final_touch
-    ci = sets.num_rows[i] + 1
-    sets.dimension[(i, ci)] = dim
-    sets.num_rows[i] += dim
-    return ci
-end
-
-function final_touch(sets::OrderedProductOfSets)
-    @assert !sets.final_touch
-    for i in 2:length(sets.num_rows)
-        sets.num_rows[i] += sets.num_rows[i-1]
+    offset = 0
+    for (i, rows) in enumerate(sets.rows)
+        for (j, row) in enumerate(rows)
+            rows[j] = offset .+ row
+            offset += length(row)
+        end
     end
     sets.final_touch = true
     return
@@ -266,103 +266,57 @@ end
 Return the number of rows corresponding to a set of type `S`. That is, it is
 the sum of the dimensions of the sets of type `S`.
 """
-function num_rows(sets::OrderedProductOfSets, ::Type{S}) where {S}
+function num_rows(sets::OrderedProductOfSets, ::Type{S})::Int where {S}
     i = set_index(sets, S)::Int
-    if !sets.final_touch || i == 1
-        return sets.num_rows[i]
+    rows = sets.rows[i]
+    if isempty(rows)
+        return 0
+    elseif sets.final_touch
+        return max(0, last(rows[end]) - first(rows[1]) + 1)
+    else
+        return mapreduce(length, +, rows)
     end
-    return sets.num_rows[i] - sets.num_rows[i-1]
 end
 
 function MOI.get(
     sets::OrderedProductOfSets{T},
     ::MOI.ListOfConstraintTypesPresent,
-) where {T}
+)::Vector{Tuple{Type,Type}} where {T}
     return Tuple{Type,Type}[
         (_affine_function_type(T, S), S) for
-        S in set_types(sets) if num_rows(sets, S) > 0
+        (i, S) in enumerate(set_types(sets)) if !isempty(sets.rows[i])
     ]
 end
-
-struct _UnevenIterator
-    i::Int
-    start::Int
-    stop::Int
-    dimension::Dict{Tuple{Int,Int},Int}
-end
-
-Base.IteratorSize(::_UnevenIterator) = Base.SizeUnknown()
-
-function Base.iterate(it::_UnevenIterator, cur = it.start)
-    if cur > it.stop
-        return nothing
-    end
-    return (cur, cur + it.dimension[(it.i, cur)])
-end
-
-function Base.in(x::Int64, it::_UnevenIterator)
-    return it.start <= x <= it.stop && haskey(it.dimension, (it.i, x))
-end
-
-function _range_iterator(
-    ::OrderedProductOfSets{T},
-    ::Int,
-    start::Int,
-    stop::Int,
-    ::Type{MOI.ScalarAffineFunction{T}},
-) where {T}
-    return start:stop
-end
-
-function _range_iterator(
-    sets::OrderedProductOfSets{T},
-    i::Int,
-    start::Int,
-    stop::Int,
-    ::Type{MOI.VectorAffineFunction{T}},
-) where {T}
-    return _UnevenIterator(i, start, stop, sets.dimension)
-end
-
-function _range_iterator(
-    sets::OrderedProductOfSets{T},
-    ::Type{F},
-    ::Type{S},
-) where {T,F,S}
-    i = set_index(sets, S)
-    if i === nothing || F != _affine_function_type(T, S)
-        return
-    end
-    return _range_iterator(sets, i, 1, num_rows(sets, S), F)
-end
-
-_length(::Nothing) = 0
-_length(r::UnitRange) = length(r)
-_length(r::_UnevenIterator) = count(_ -> true, r)
 
 function MOI.get(
     sets::OrderedProductOfSets,
     ::MOI.NumberOfConstraints{F,S},
-) where {F,S}
-    r = _range_iterator(sets, F, S)
-    return _length(r)
+)::Int64 where {F,S}
+    i = set_index(sets, S)::Union{Nothing,Int}
+    if i == nothing
+        return 0
+    end
+    return length(sets.rows[i])
 end
 
 function MOI.get(
     sets::OrderedProductOfSets,
     ::MOI.ListOfConstraintIndices{F,S},
-) where {F,S}
-    rows = _range_iterator(sets, F, S)
-    if rows === nothing
+)::Vector{MOI.ConstraintIndex{F,S}} where {F,S}
+    i = set_index(sets, S)::Union{Nothing,Int}
+    if i == nothing
         return MOI.ConstraintIndex{F,S}[]
     end
-    return MOI.ConstraintIndex{F,S}.(rows)
+    return MOI.ConstraintIndex{F,S}.(1:length(sets.rows[i]))
 end
 
 function MOI.is_valid(
     sets::OrderedProductOfSets,
     ci::MOI.ConstraintIndex{F,S},
-) where {F,S}
-    r = _range_iterator(sets, F, S)
-    return r !== nothing && ci.value in r
+)::Bool where {F,S}
+    i = set_index(sets, S)::Union{Nothing,Int}
+    if i == nothing
+        return false
+    end
+    return 1 <= ci.value <= length(sets.rows[i])
 end
